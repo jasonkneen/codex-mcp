@@ -21,6 +21,7 @@ import {
 import { handleExecCommand } from "./handle-exec-command.js";
 import { randomUUID } from "node:crypto";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
+import { getMcpToolDefinitions, handleMcpFunctionCall } from "./mcp.js";
 
 // Wait time before retrying after rate limit errors (ms).
 const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
@@ -314,6 +315,11 @@ export class AgentLoop {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const callId: string = (item as any).call_id ?? (item as any).id;
 
+    // If function name matches a configured MCP server, route the call
+    if (this.config?.mcpServers && name && name in this.config.mcpServers) {
+      return handleMcpFunctionCall(this.config.mcpServers, name, rawArguments, callId);
+    }
+
     const args = parseToolCallArguments(rawArguments ?? "{}");
     if (isLoggingEnabled()) {
       log(
@@ -508,6 +514,29 @@ export class AgentLoop {
                 `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
               );
             }
+
+            // Prepare tool definitions: always include shell, plus one per MCP server
+            const toolsList: Array<any> = [
+              {
+                type: "function",
+                name: "shell",
+                description: "Runs a shell command, and returns its output.",
+                strict: false,
+                parameters: {
+                  type: "object",
+                  properties: {
+                    command: { type: "array", items: { type: "string" } },
+                    workdir: { type: "string", description: "The working directory for the command." },
+                    timeout: { type: "number", description: "Max time to wait for command (ms)." },
+                  },
+                  required: ["command"],
+                  additionalProperties: false,
+                },
+              },
+            ];
+            // Include MCP function definitions, if any
+            toolsList.push(...getMcpToolDefinitions(this.config?.mcpServers));
+
             // eslint-disable-next-line no-await-in-loop
             stream = await this.oai.responses.create({
               model: this.model,
@@ -517,31 +546,7 @@ export class AgentLoop {
               stream: true,
               parallel_tool_calls: false,
               reasoning,
-              tools: [
-                {
-                  type: "function",
-                  name: "shell",
-                  description: "Runs a shell command, and returns its output.",
-                  strict: false,
-                  parameters: {
-                    type: "object",
-                    properties: {
-                      command: { type: "array", items: { type: "string" } },
-                      workdir: {
-                        type: "string",
-                        description: "The working directory for the command.",
-                      },
-                      timeout: {
-                        type: "number",
-                        description:
-                          "The maximum time to wait for the command to complete in milliseconds.",
-                      },
-                    },
-                    required: ["command"],
-                    additionalProperties: false,
-                  },
-                },
-              ],
+              tools: toolsList,
             });
             break;
           } catch (error) {
