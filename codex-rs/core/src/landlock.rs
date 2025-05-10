@@ -1,16 +1,13 @@
 use std::collections::BTreeMap;
-use std::io;
+use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::error::SandboxErr;
-use crate::exec::exec;
-use crate::exec::ExecParams;
-use crate::exec::RawExecToolCallOutput;
 use crate::protocol::SandboxPolicy;
 
+use landlock::ABI;
 use landlock::Access;
 use landlock::AccessFs;
 use landlock::CompatLevel;
@@ -18,8 +15,6 @@ use landlock::Compatible;
 use landlock::Ruleset;
 use landlock::RulesetAttr;
 use landlock::RulesetCreatedAttr;
-use landlock::ABI;
-use seccompiler::apply_filter;
 use seccompiler::BpfProgram;
 use seccompiler::SeccompAction;
 use seccompiler::SeccompCmpArgLen;
@@ -28,48 +23,27 @@ use seccompiler::SeccompCondition;
 use seccompiler::SeccompFilter;
 use seccompiler::SeccompRule;
 use seccompiler::TargetArch;
-use tokio::sync::Notify;
+use seccompiler::apply_filter;
 
-pub async fn exec_linux(
-    params: ExecParams,
-    writable_roots: &[PathBuf],
-    ctrl_c: Arc<Notify>,
-    sandbox_policy: SandboxPolicy,
-) -> Result<RawExecToolCallOutput> {
-    // Allow READ on /
-    // Allow WRITE on /dev/null
-    let ctrl_c_copy = ctrl_c.clone();
-    let writable_roots_copy = writable_roots.to_vec();
-
-    // Isolate thread to run the sandbox from
-    let tool_call_output = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
-
-        rt.block_on(async {
-            if sandbox_policy.is_network_restricted() {
-                install_network_seccomp_filter_on_current_thread()?;
-            }
-
-            if sandbox_policy.is_file_write_restricted() {
-                install_filesystem_landlock_rules_on_current_thread(writable_roots_copy)?;
-            }
-
-            exec(params, ctrl_c_copy).await
-        })
-    })
-    .join();
-
-    match tool_call_output {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(CodexErr::Io(io::Error::new(
-            io::ErrorKind::Other,
-            format!("thread join failed: {e:?}"),
-        ))),
+/// Apply sandbox policies inside this thread so only the child inherits
+/// them, not the entire CLI process.
+pub(crate) fn apply_sandbox_policy_to_current_thread(
+    sandbox_policy: &SandboxPolicy,
+    cwd: &Path,
+) -> Result<()> {
+    if !sandbox_policy.has_full_network_access() {
+        install_network_seccomp_filter_on_current_thread()?;
     }
+
+    if !sandbox_policy.has_full_disk_write_access() {
+        let writable_roots = sandbox_policy.get_writable_roots_with_cwd(cwd);
+        install_filesystem_landlock_rules_on_current_thread(writable_roots)?;
+    }
+
+    // TODO(ragona): Add appropriate restrictions if
+    // `sandbox_policy.has_full_disk_read_access()` is `false`.
+
+    Ok(())
 }
 
 /// Installs Landlock file-system rules on the current thread allowing read
@@ -78,9 +52,7 @@ pub async fn exec_linux(
 ///
 /// # Errors
 /// Returns [`CodexErr::Sandbox`] variants when the ruleset fails to apply.
-pub fn install_filesystem_landlock_rules_on_current_thread(
-    writable_roots: Vec<PathBuf>,
-) -> Result<()> {
+fn install_filesystem_landlock_rules_on_current_thread(writable_roots: Vec<PathBuf>) -> Result<()> {
     let abi = ABI::V5;
     let access_rw = AccessFs::from_all(abi);
     let access_ro = AccessFs::from_read(abi);
@@ -108,7 +80,7 @@ pub fn install_filesystem_landlock_rules_on_current_thread(
 
 /// Installs a seccomp filter that blocks outbound network access except for
 /// AF_UNIX domain sockets.
-pub fn install_network_seccomp_filter_on_current_thread() -> std::result::Result<(), SandboxErr> {
+fn install_network_seccomp_filter_on_current_thread() -> std::result::Result<(), SandboxErr> {
     // Build rule map.
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
@@ -167,11 +139,13 @@ pub fn install_network_seccomp_filter_on_current_thread() -> std::result::Result
 }
 
 #[cfg(test)]
-mod tests_linux {
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
-    use crate::exec::process_exec_tool_call;
     use crate::exec::ExecParams;
     use crate::exec::SandboxType;
+    use crate::exec::process_exec_tool_call;
     use crate::protocol::SandboxPolicy;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
@@ -181,18 +155,17 @@ mod tests_linux {
     async fn run_cmd(cmd: &[&str], writable_roots: &[PathBuf], timeout_ms: u64) {
         let params = ExecParams {
             command: cmd.iter().map(|elm| elm.to_string()).collect(),
-            workdir: None,
+            cwd: std::env::current_dir().expect("cwd should exist"),
             timeout_ms: Some(timeout_ms),
         };
-        let res = process_exec_tool_call(
-            params,
-            SandboxType::LinuxSeccomp,
-            writable_roots,
-            Arc::new(Notify::new()),
-            SandboxPolicy::NetworkAndFileWriteRestricted,
-        )
-        .await
-        .unwrap();
+
+        let sandbox_policy =
+            SandboxPolicy::new_read_only_policy_with_writable_roots(writable_roots);
+        let ctrl_c = Arc::new(Notify::new());
+        let res =
+            process_exec_tool_call(params, SandboxType::LinuxSeccomp, ctrl_c, &sandbox_policy)
+                .await
+                .unwrap();
 
         if res.exit_code != 0 {
             println!("stdout:\n{}", res.stdout);
@@ -255,20 +228,17 @@ mod tests_linux {
     async fn assert_network_blocked(cmd: &[&str]) {
         let params = ExecParams {
             command: cmd.iter().map(|s| s.to_string()).collect(),
-            workdir: None,
+            cwd: std::env::current_dir().expect("cwd should exist"),
             // Give the tool a generous 2‑second timeout so even slow DNS timeouts
             // do not stall the suite.
             timeout_ms: Some(2_000),
         };
 
-        let result = process_exec_tool_call(
-            params,
-            SandboxType::LinuxSeccomp,
-            &[],
-            Arc::new(Notify::new()),
-            SandboxPolicy::NetworkRestricted,
-        )
-        .await;
+        let sandbox_policy = SandboxPolicy::new_read_only_policy();
+        let ctrl_c = Arc::new(Notify::new());
+        let result =
+            process_exec_tool_call(params, SandboxType::LinuxSeccomp, ctrl_c, &sandbox_policy)
+                .await;
 
         let (exit_code, stdout, stderr) = match result {
             Ok(output) => (output.exit_code, output.stdout, output.stderr),
