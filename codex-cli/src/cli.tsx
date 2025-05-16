@@ -10,9 +10,11 @@ import type { ApprovalPolicy } from "./approvals";
 import type { CommandConfirmation } from "./utils/agent/agent-loop";
 import type { AppConfig } from "./utils/config";
 import type { ResponseItem } from "openai/resources/responses/responses";
+import type { ReasoningEffort } from "openai/resources.mjs";
 
 import App from "./app";
 import { runSinglePass } from "./cli-singlepass";
+import SessionsOverlay from "./components/sessions-overlay.js";
 import { AgentLoop } from "./utils/agent/agent-loop";
 import { ReviewDecision } from "./utils/agent/review";
 import { AutoApprovalMode } from "./utils/auto-approval-mode";
@@ -55,10 +57,11 @@ const cli = meow(
     --version                       Print version and exit
 
     -h, --help                      Show usage and exit
-    -m, --model <model>             Model to use for completions (default: o4-mini)
+    -m, --model <model>             Model to use for completions (default: codex-mini-latest)
     -p, --provider <provider>       Provider to use for completions (default: openai)
     -i, --image <path>              Path(s) to image files to include as input
     -v, --view <rollout>            Inspect a previously saved rollout instead of starting a session
+    --history                       Browse previous sessions
     -q, --quiet                     Non-interactive mode that only prints the assistant's final output
     -c, --config                    Open the instructions file in your editor
     -w, --writable-root <path>      Writable folder for sandbox in full-auto mode (can be specified multiple times)
@@ -67,7 +70,7 @@ const cli = meow(
     --auto-edit                Automatically approve file edits; still prompt for commands
     --full-auto                Automatically approve edits and commands when executed in the sandbox
 
-    --no-project-doc           Do not automatically include the repository's 'codex.md'
+    --no-project-doc           Do not automatically include the repository's 'AGENTS.md'
     --project-doc <file>       Include an additional markdown file at <file> as context
     --full-stdout              Do not truncate stdout/stderr from command outputs
     --notify                   Enable desktop notifications for responses
@@ -77,6 +80,8 @@ const cli = meow(
 
     --flex-mode               Use "flex-mode" processing mode for the request (only supported
                               with models o3 and o4-mini)
+
+    --reasoning <effort>      Set the reasoning effort level (low, medium, high) (default: high)
 
   Dangerous options
     --dangerously-auto-approve-everything
@@ -101,6 +106,7 @@ const cli = meow(
       help: { type: "boolean", aliases: ["h"] },
       version: { type: "boolean", description: "Print version and exit" },
       view: { type: "string" },
+      history: { type: "boolean", description: "Browse previous sessions" },
       model: { type: "string", aliases: ["m"] },
       provider: { type: "string", aliases: ["p"] },
       image: { type: "string", isMultiple: true, aliases: ["i"] },
@@ -143,7 +149,7 @@ const cli = meow(
       },
       noProjectDoc: {
         type: "boolean",
-        description: "Disable automatic inclusion of project-level codex.md",
+        description: "Disable automatic inclusion of project-level AGENTS.md",
       },
       projectDoc: {
         type: "string",
@@ -159,6 +165,12 @@ const cli = meow(
         description:
           "Disable truncation of command stdout/stderr messages (show everything)",
         aliases: ["no-truncate"],
+      },
+      reasoning: {
+        type: "string",
+        description: "Set the reasoning effort level (low, medium, high)",
+        choices: ["low", "medium", "high"],
+        default: "high",
       },
       // Notification
       notify: {
@@ -252,7 +264,10 @@ let config = loadConfig(undefined, undefined, {
   isFullContext: fullContextMode,
 });
 
-const prompt = cli.input[0];
+// `prompt` can be updated later when the user resumes a previous session
+// via the `--history` flag. Therefore it must be declared with `let` rather
+// than `const`.
+let prompt = cli.input[0];
 const model = cli.flags.model ?? config.model;
 const imagePaths = cli.flags.image;
 const provider = cli.flags.provider ?? config.provider ?? "openai";
@@ -287,17 +302,22 @@ if (!apiKey && !NO_API_KEY_REQUIRED.has(provider.toLowerCase())) {
   process.exit(1);
 }
 
+const flagPresent = Object.hasOwn(cli.flags, "disableResponseStorage");
+
+const disableResponseStorage = flagPresent
+  ? Boolean(cli.flags.disableResponseStorage) // value user actually passed
+  : (config.disableResponseStorage ?? false); // fall back to YAML, default to false
+
 config = {
   apiKey,
   ...config,
   model: model ?? config.model,
   notify: Boolean(cli.flags.notify),
-  flexMode: Boolean(cli.flags.flexMode),
+  reasoningEffort:
+    (cli.flags.reasoning as ReasoningEffort | undefined) ?? "medium",
+  flexMode: cli.flags.flexMode || (config.flexMode ?? false),
   provider,
-  disableResponseStorage:
-    cli.flags.disableResponseStorage !== undefined
-      ? Boolean(cli.flags.disableResponseStorage)
-      : config.disableResponseStorage,
+  disableResponseStorage,
 };
 
 // Check for updates after loading config. This is important because we write state file in
@@ -309,15 +329,19 @@ try {
 }
 
 // For --flex-mode, validate and exit if incorrect.
-if (cli.flags.flexMode) {
+if (config.flexMode) {
   const allowedFlexModels = new Set(["o3", "o4-mini"]);
   if (!allowedFlexModels.has(config.model)) {
-    // eslint-disable-next-line no-console
-    console.error(
-      `The --flex-mode option is only supported when using the 'o3' or 'o4-mini' models. ` +
-        `Current model: '${config.model}'.`,
-    );
-    process.exit(1);
+    if (cli.flags.flexMode) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `The --flex-mode option is only supported when using the 'o3' or 'o4-mini' models. ` +
+          `Current model: '${config.model}'.`,
+      );
+      process.exit(1);
+    } else {
+      config.flexMode = false;
+    }
   }
 }
 
@@ -336,6 +360,46 @@ if (
 }
 
 let rollout: AppRollout | undefined;
+
+// For --history, show session selector and optionally update prompt or rollout.
+if (cli.flags.history) {
+  const result: { path: string; mode: "view" | "resume" } | null =
+    await new Promise((resolve) => {
+      const instance = render(
+        React.createElement(SessionsOverlay, {
+          onView: (p: string) => {
+            instance.unmount();
+            resolve({ path: p, mode: "view" });
+          },
+          onResume: (p: string) => {
+            instance.unmount();
+            resolve({ path: p, mode: "resume" });
+          },
+          onExit: () => {
+            instance.unmount();
+            resolve(null);
+          },
+        }),
+      );
+    });
+
+  if (!result) {
+    process.exit(0);
+  }
+
+  if (result.mode === "view") {
+    try {
+      const content = fs.readFileSync(result.path, "utf-8");
+      rollout = JSON.parse(content) as AppRollout;
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("Error reading session file:", error);
+      process.exit(1);
+    }
+  } else {
+    prompt = `Resume this session: ${result.path}`;
+  }
+}
 
 // For --view, optionally load an existing rollout from disk, display it and exit.
 if (cli.flags.view) {
